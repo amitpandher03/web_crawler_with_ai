@@ -4,6 +4,8 @@ from openai import OpenAI
 from config import Config
 from tavily import TavilyClient
 from prompts import query_writer_instructions, summarizer_instructions, reflection_instructions
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Inizializzazione del client OpenAI con le configurazioni
 client = OpenAI(base_url = Config.AI_API_URL, api_key = Config.AI_API_KEY)
@@ -36,20 +38,25 @@ URL: {result['url']}\n===\n
 Contenuto più rilevante: {result['content']}\n===\n
 """
 
-def web_research(search_query):
+async def web_research(search_query):
     tavily_api_key = Config.TAVILY_API_KEY
     max_results = 3
-    include_raw = False
-
-    client = TavilyClient(api_key = tavily_api_key)
-    response = client.search(
+    
+    # Run Tavily search in a thread pool to not block
+    with ThreadPoolExecutor() as executor:
+        client = TavilyClient(api_key=tavily_api_key)
+        response = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            lambda: client.search(
                 query=search_query,
                 max_results=max_results,
-                include_raw_content=include_raw
+                include_raw_content=False
             )
+        )
+    
     results = response.get('results', [])
-    titles = [result['title'] for result in results ]
-    contents = [_format_content(result) for result in results ]
+    titles = [result['title'] for result in results]
+    contents = [_format_content(result) for result in results]
     
     return {
         "sources_gathered": titles,
@@ -87,70 +94,57 @@ def reflect_on_summary(research_topic, running_summary):
 
 @cl.on_message
 async def main(message: cl.Message):
-    # Add initial message elements
-    msg = cl.Message(content="Iniziando la ricerca...", author="system_assistant")
+    # Create a streaming message
+    msg = cl.Message(content="", author="system_assistant")
     await msg.send()
-    
-    # Fase 1: Generazione della query iniziale
+
     user_message = message.content
     
     try:
-        await cl.Message(content="Ottimizzando la query di ricerca...", author="system_assistant").send()
+        await msg.stream_token("Ottimizzando la query di ricerca...\n")
         osq = optimize_search_query(user_message)
 
-        # feedback per l'utente
         query, aspect, reason = osq['query'], osq['aspect'], osq['reason']
-        await cl.Message(
-            author="system_assistant", 
-            content=f"Query di ricerca ottimizzata:\n {query}.\n Mi sono soffermato su questo aspetto:\n {aspect}.\n Per questo motivo:\n {reason}.\n"
-        ).send()
+        await msg.stream_token(
+            f"Query di ricerca ottimizzata: {query}\n"
+            f"Aspetto analizzato: {aspect}\n"
+            f"Motivazione: {reason}\n\n"
+        )
 
-        # Fase 2: Ciclo di ricerca e approfondimento
         running_summary = None
         max_cycles = 3
 
         while max_cycles > 0:
-            # Esegui la ricerca web
-            await cl.Message(content="Cercando informazioni sul web...", author="system_assistant").send()
-            results = web_research(query)
+            await msg.stream_token("Cercando informazioni sul web...\n")
+            results = await web_research(query)
 
-            # Add sources feedback
             titles = "\n".join(results['sources_gathered'])
-            await cl.Message(
-                author="system_assistant", 
-                content=f"Fonti trovate:\n{titles}"
-            ).send()
+            await msg.stream_token(f"Fonti trovate:\n{titles}\n\n")
             
-            # Genera o aggiorna il riassunto
             summary = summarize_sources(results['web_research_results'], query, running_summary)
             running_summary = summary
 
-            # feedback per l'utente
-            await cl.Message(author="system_assistant", content=f"Riassunto attuale:\n{summary}").send()
+            await msg.stream_token(f"Riassunto attuale:\n{summary}\n\n")
 
             max_cycles -= 1
             if max_cycles <= 0:
                 break
 
-            # Genera la prossima query di approfondimento
             ros = reflect_on_summary(query, summary)
             query = ros.get('domanda_approfondimento', f"Dimmi di più su {query}")
             lacuna_conoscenza = ros.get('lacuna_conoscenza', "")
 
-            await cl.Message(
-                author="system_assistant", 
-                content=f"Prossima ricerca:\n{query}\nMotivazione:\n{lacuna_conoscenza}"
-            ).send()
+            await msg.stream_token(
+                f"Prossima ricerca: {query}\n"
+                f"Motivazione: {lacuna_conoscenza}\n\n"
+            )
         
     except Exception as e:
-        await cl.Message(
-            author="system_assistant",
-            content=f"Si è verificato un errore durante la ricerca: {str(e)}"
-        ).send()
+        await msg.stream_token(f"Si è verificato un errore durante la ricerca: {str(e)}")
         return
 
-    # Risultato finale
-    await cl.Message(
-        author="segugio_assistant",
-        content=f"Risposta alla tua domanda:\n\n{message.content}\n\nRisposta finale:\n\n{running_summary}"
-    ).send()
+    # Final result with the original question
+    await msg.stream_token(
+        f"Domanda originale: {message.content}\n\n"
+        f"Risposta finale:\n{running_summary}"
+    )
