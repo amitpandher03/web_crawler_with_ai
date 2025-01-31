@@ -37,7 +37,7 @@ Contenuto più rilevante: {result['content']}\n===\n
 """
 
 def web_research(search_query):
-    tavily_api_key = "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"
+    tavily_api_key = Config.TAVILY_API_KEY
     max_results = 3
     include_raw = False
 
